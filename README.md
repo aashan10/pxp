@@ -1,10 +1,9 @@
 ![](/art/hero.png)
 
+> [!NOTE]
+> No longer under active development. [Read more here](https://ryangjchandler.co.uk/posts/saying-goodbye-to-pxp).
+
 A suite of high-performance tools for PHP developers. Written in Rust, designed for performance and reliability.
-
-## Contributing
-
-All contributions to the project are welcome. For more information about contribution guidelines, please read the [CONTRIBUTING](CONTRIBUTING.md) document.
 
 ## Credits
 
