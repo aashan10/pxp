@@ -6,7 +6,7 @@ use std::{
 use clap::Args;
 use dashmap::DashMap;
 use pxp_ast::{Name, NameKind, Node};
-use pxp_index::{FileId, Index};
+use pxp_index::{FileId, HasLocation, Index};
 use pxp_lexer::Lexer;
 use pxp_node_finder::NodeFinder;
 use pxp_parser::Parser;
@@ -308,15 +308,86 @@ impl PxpLanguageServer {
         Ok(None)
     }
 
-    /// Extract symbol information from AST node - simplified version
+    /// Extract symbol information from AST node
     async fn extract_symbol_info(&self, node: &Node<'_>, _content: &str) -> Option<SymbolInfo> {
-        // For now, return basic placeholder information based on node type
-        // This is a simplified implementation to get the LSP working
+        let index = self.index.read().await;
+        
+        // Check for simple variable
+        if let Some(var) = node.as_simple_variable() {
+            return Some(SymbolInfo {
+                name: format!("${}", String::from_utf8_lossy(&var.symbol)),
+                kind: SymbolKind::Variable,
+                location: node.span,
+                hover_info: format!("**Variable:** `${}`", String::from_utf8_lossy(&var.symbol)),
+            });
+        }
+        
+        // Check for function call
+        if let Some(call) = node.as_function_call_expression() {
+            if let Ok(name) = std::str::from_utf8(&call.target.span.view(_content.as_bytes()).to_bytes()) {
+                if let Some(function) = index.get_function(name) {
+                    return Some(SymbolInfo {
+                        name: name.to_string(),
+                        kind: SymbolKind::Function,
+                        location: node.span,
+                        hover_info: format!("**Function:** `{}`\n\nDefined in: {}", 
+                            name, 
+                            index.get_file_path(function.location())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        ),
+                    });
+                }
+            }
+        }
+        
+        // Check for class instantiation (new) - skip for now as as_new doesn't exist
+        // TODO: Implement when as_new() method is available
+        
+        // Check for method call - skip for now as as_method_call doesn't exist
+        // TODO: Implement when as_method_call() method is available
+        
+        // Check for name (class/function reference)
+        if let Some(name_node) = node.as_name() {
+            let name_string = self.extract_name_string(name_node);
+            
+            // Check if it's a class
+            if let Some(class) = index.get_class(name_string.as_str()) {
+                return Some(SymbolInfo {
+                    name: name_string.clone(),
+                    kind: SymbolKind::Class,
+                    location: node.span,
+                    hover_info: format!("**Class:** `{}`\n\nDefined in: {}", 
+                        name_string,
+                        index.get_file_path(class.location())
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                });
+            }
+            
+            // Check if it's a function
+            if let Some(function) = index.get_function(name_string.as_str()) {
+                return Some(SymbolInfo {
+                    name: name_string.clone(),
+                    kind: SymbolKind::Function,
+                    location: node.span,
+                    hover_info: format!("**Function:** `{}`\n\nDefined in: {}", 
+                        name_string,
+                        index.get_file_path(function.location())
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                });
+            }
+        }
+        
+        // Default case - general symbol info
         Some(SymbolInfo {
-            name: format!("Symbol at position"),
+            name: format!("Symbol"),
             kind: SymbolKind::Variable,
             location: node.span,
-            hover_info: format!("**Symbol information**\n\nType: {}", node.name()),
+            hover_info: format!("**Symbol**\n\nType: {}", node.name()),
         })
     }
 
@@ -388,16 +459,38 @@ impl PxpLanguageServer {
         Ok(None)
     }
 
-    /// Create LSP Location from function entity - simplified for now
-    async fn create_location_from_function(&self, _function: &pxp_index::ReflectionFunction<'_>) -> Option<Location> {
-        // TODO: Implement once file path mapping is available
-        None
+    /// Create LSP Location from function entity
+    async fn create_location_from_function(&self, function: &pxp_index::ReflectionFunction<'_>) -> Option<Location> {
+        let index = self.index.read().await;
+        let path = index.get_file_path(function.location())?;
+        let uri = Url::from_file_path(path).ok()?;
+        let content = tokio::fs::read_to_string(path).await.ok()?;
+        
+        let location = function.location();
+        let span = location.span();
+        let range = Range {
+            start: self.byte_offset_to_position(&content, span.start),
+            end: self.byte_offset_to_position(&content, span.end),
+        };
+        
+        Some(Location { uri, range })
     }
 
-    /// Create LSP Location from class entity - simplified for now  
-    async fn create_location_from_class(&self, _class: &pxp_index::ReflectionClass<'_>) -> Option<Location> {
-        // TODO: Implement once file path mapping is available
-        None
+    /// Create LSP Location from class entity
+    async fn create_location_from_class(&self, class: &pxp_index::ReflectionClass<'_>) -> Option<Location> {
+        let index = self.index.read().await;
+        let path = index.get_file_path(class.location())?;
+        let uri = Url::from_file_path(path).ok()?;
+        let content = tokio::fs::read_to_string(path).await.ok()?;
+        
+        let location = class.location();
+        let span = location.span();
+        let range = Range {
+            start: self.byte_offset_to_position(&content, span.start),
+            end: self.byte_offset_to_position(&content, span.end),
+        };
+        
+        Some(Location { uri, range })
     }
 
     // For now, we'll skip method-specific goto definition until we have proper method resolution
