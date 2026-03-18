@@ -5,24 +5,45 @@ use std::{
 
 use clap::Args;
 use dashmap::DashMap;
+use pxp_ast::{Name, NameKind, Node};
 use pxp_index::{FileId, Index};
 use pxp_lexer::Lexer;
+use pxp_node_finder::NodeFinder;
 use pxp_parser::Parser;
+use pxp_span::{byte_offset_to_line_and_column, ByteOffset, IsSpanned};
 use tokio::sync::RwLock;
 use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
         CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-        DidOpenTextDocumentParams, DidSaveTextDocumentParams, Hover, HoverContents,
-        HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-        InitializedParams, MarkupContent, MarkupKind, MessageType,
-        Position, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-        TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+        DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+        GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+        InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent,
+        MarkupKind, MessageType, OneOf, Position, Range, ServerCapabilities, ServerInfo,
+        TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
     },
     Client, LanguageServer,
 };
 use tracing::{error, info, warn};
+
+/// Symbol information extracted from AST nodes
+#[derive(Debug, Clone)]
+struct SymbolInfo {
+    name: String,
+    kind: SymbolKind,
+    location: pxp_span::Span,
+    hover_info: String,
+}
+
+/// Types of symbols we can identify
+#[derive(Debug, Clone, PartialEq)]
+enum SymbolKind {
+    Function,
+    Class,
+    Method,
+    Variable,
+}
 
 #[derive(Args, Debug)]
 pub struct Lsp {
@@ -234,22 +255,167 @@ impl PxpLanguageServer {
         Ok(completions)
     }
 
-    /// Get hover information for a position
-    async fn get_hover(&self, _uri: &Url, _position: Position) -> Result<Option<Hover>> {
-        // This is a placeholder implementation
-        // In a real LSP, you'd need to:
-        // 1. Parse the document to find the symbol at the position
-        // 2. Look up the symbol in the index
-        // 3. Return type information, documentation, etc.
+    /// Convert LSP position to byte offset
+    async fn position_to_byte_offset(&self, uri: &Url, position: Position) -> Result<ByteOffset> {
+        let content = self.open_files.get(uri)
+            .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("File not found in open files"))?;
         
-        Ok(Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: "Hover information will be implemented based on symbol lookup".to_string(),
-            }),
-            range: None,
-        }))
+        let lines: Vec<&str> = content.lines().collect();
+        let mut offset = 0;
+        
+        // Add bytes for all lines before the target line
+        for (line_idx, line) in lines.iter().enumerate() {
+            if line_idx as u32 >= position.line {
+                break;
+            }
+            offset += line.len() + 1; // +1 for newline character
+        }
+        
+        // Add bytes for characters within the target line
+        if let Some(target_line) = lines.get(position.line as usize) {
+            let char_offset = std::cmp::min(position.character as usize, target_line.len());
+            offset += char_offset;
+        }
+        
+        Ok(offset)
     }
+
+    /// Convert byte offset to LSP position
+    fn byte_offset_to_position(&self, source: &str, offset: ByteOffset) -> Position {
+        let (line, column) = byte_offset_to_line_and_column(source.as_bytes(), offset);
+        Position {
+            line: line as u32,
+            character: column as u32,
+        }
+    }
+
+    /// Find symbol at position and get symbol information
+    async fn find_symbol_at_position(&self, uri: &Url, position: Position) -> Result<Option<SymbolInfo>> {
+        let content = self.open_files.get(uri)
+            .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("File not found in open files"))?;
+        
+        let offset = self.position_to_byte_offset(uri, position).await?;
+        
+        // Parse the document
+        let parse_result = Parser::parse(pxp_lexer::Lexer::new(content.as_bytes()));
+        
+        // Find the node at the given position
+        if let Some((node, _ancestors)) = NodeFinder::find_at_byte_offset(&parse_result.ast, offset) {
+            let symbol_info = self.extract_symbol_info(&node, &content).await;
+            return Ok(symbol_info);
+        }
+        
+        Ok(None)
+    }
+
+    /// Extract symbol information from AST node - simplified version
+    async fn extract_symbol_info(&self, node: &Node<'_>, _content: &str) -> Option<SymbolInfo> {
+        // For now, return basic placeholder information based on node type
+        // This is a simplified implementation to get the LSP working
+        Some(SymbolInfo {
+            name: format!("Symbol at position"),
+            kind: SymbolKind::Variable,
+            location: node.span,
+            hover_info: format!("**Symbol information**\n\nType: {}", node.name()),
+        })
+    }
+
+    /// Extract name string from Name AST node
+    fn extract_name_string(&self, name: &Name) -> String {
+        match &name.kind {
+            NameKind::Resolved(resolved) => String::from_utf8_lossy(&resolved.resolved).to_string(),
+            NameKind::Unresolved(unresolved) => String::from_utf8_lossy(&unresolved.symbol).to_string(),
+            NameKind::Special(_special) => "special".to_string(),
+        }
+    }
+
+    /// Get hover information for a position
+    async fn get_hover(&self, uri: &Url, position: Position) -> Result<Option<Hover>> {
+        info!("Hover request at {}:{} in {}", position.line, position.character, uri);
+        
+        if let Some(symbol_info) = self.find_symbol_at_position(uri, position).await? {
+            let content = self.open_files.get(uri).unwrap();
+            let range = Some(Range {
+                start: self.byte_offset_to_position(&content, symbol_info.location.start),
+                end: self.byte_offset_to_position(&content, symbol_info.location.end),
+            });
+            
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: symbol_info.hover_info,
+                }),
+                range,
+            }));
+        }
+        
+        Ok(None)
+    }
+
+    /// Get definition location for a symbol
+    async fn get_definition(&self, uri: &Url, position: Position) -> Result<Option<GotoDefinitionResponse>> {
+        info!("Go to definition request at {}:{} in {}", position.line, position.character, uri);
+        
+        if let Some(symbol_info) = self.find_symbol_at_position(uri, position).await? {
+            let index = self.index.read().await;
+            
+            match symbol_info.kind {
+                SymbolKind::Function => {
+                    if let Some(function) = index.get_function(symbol_info.name.as_str()) {
+                        if let Some(location) = self.create_location_from_function(&function).await {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                        }
+                    }
+                },
+                SymbolKind::Class => {
+                    if let Some(class) = index.get_class(symbol_info.name.as_str()) {
+                        if let Some(location) = self.create_location_from_class(&class).await {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                        }
+                    }
+                },
+                SymbolKind::Method => {
+                    // For now, methods will just show "Not implemented" 
+                    // TODO: Implement proper method goto definition
+                },
+                SymbolKind::Variable => {
+                    // Variables don't have global definitions in PHP
+                    // Could implement local variable definition finding in the future
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Create LSP Location from function entity - simplified for now
+    async fn create_location_from_function(&self, _function: &pxp_index::ReflectionFunction<'_>) -> Option<Location> {
+        // TODO: Implement once file path mapping is available
+        None
+    }
+
+    /// Create LSP Location from class entity - simplified for now  
+    async fn create_location_from_class(&self, _class: &pxp_index::ReflectionClass<'_>) -> Option<Location> {
+        // TODO: Implement once file path mapping is available
+        None
+    }
+
+    // For now, we'll skip method-specific goto definition until we have proper method resolution
+    // async fn create_location_from_method(&self, method: &pxp_index::ReflectionMethod<'_>) -> Option<Location> {
+    //     if let Some(path) = self.index.read().await.get_file_path(method.location()) {
+    //         let uri = Url::from_file_path(path).ok()?;
+    //         let content = tokio::fs::read_to_string(path).await.ok()?;
+    //         
+    //         let location = method.location();
+    //         let range = Range {
+    //             start: self.byte_offset_to_position(&content, location.span().start),
+    //             end: self.byte_offset_to_position(&content, location.span().end),
+    //         };
+    //         
+    //         return Some(Location { uri, range });
+    //     }
+    //     None
+    // }
 }
 
 #[tower_lsp::async_trait]
@@ -288,6 +454,7 @@ impl LanguageServer for PxpLanguageServer {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -382,9 +549,14 @@ impl LanguageServer for PxpLanguageServer {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        info!("Hover request at {}:{} in {}", position.line, position.character, uri);
-
         self.get_hover(uri, position).await
+    }
+
+    async fn goto_definition(&self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        self.get_definition(uri, position).await
     }
 }
 

@@ -248,7 +248,7 @@ fn line_to_byte_offset(source: &[u8], line: usize) -> ByteOffset {
     offset
 }
 
-fn byte_offset_to_line_and_column(source: &[u8], offset: ByteOffset) -> (usize, usize) {
+pub fn byte_offset_to_line_and_column(source: &[u8], offset: ByteOffset) -> (usize, usize) {
     // Line and column numbers are 0-based in the LSP spec.
     let mut line = 0;
     let mut column = 0;
